@@ -1,0 +1,431 @@
+---
+title: "Spark"
+format: html
+editor: visual
+---
+
+## Spark
+
+```{r}
+library(sparklyr)
+library(tidyverse)
+sc <- spark_connect(master = Sys.getenv("SPARK_MASTER_URL"))
+```
+
+
+```{r}
+flights_tbl <- copy_to(sc, nycflights13::flights, "spark_flights", overwrite = TRUE)
+flights_tbl %>%
+  group_by(tailnum) %>%
+  summarise(
+    count = n(), 
+    dist = mean(distance, na.rm = TRUE), 
+    delay = mean(arr_delay, na.rm = TRUE)
+    ) %>%
+  filter(count > 20, dist < 2000, !is.na(delay)) 
+```
+
+```{r}
+mtcars_tbl <- copy_to(sc, mtcars, overwrite = TRUE)
+
+partitions <- mtcars_tbl %>%
+  select(mpg, wt, cyl) %>% 
+  sdf_random_split(training = 0.5, test = 0.5, seed = 1099)
+
+fit <- partitions$training %>%
+  ml_linear_regression(mpg ~ .)
+
+summary(fit)
+
+pred <- ml_predict(fit, partitions$test)
+pred
+```
+
+
+```{r}
+library(future)
+library(sparklyr)
+
+
+if(file.exists("source")) unlink("source", TRUE)
+if(file.exists("source-out")) unlink("source-out", TRUE)
+
+stream_generate_test(iterations = 1)
+read_folder <- stream_read_csv(sc, "source") 
+write_output <- stream_write_csv(read_folder, "source-out")
+invisible(future(stream_generate_test(interval = 0.5)))
+
+stream_view(write_output)
+```
+
+
+```{r}
+library(future)
+library(sparklyr)
+library(dplyr, warn.conflicts = FALSE)
+
+if(file.exists("source")) unlink("source", TRUE)
+if(file.exists("source-out")) unlink("source-out", TRUE)
+
+stream_generate_test(iterations = 1)
+read_folder <- stream_read_csv(sc, "source") 
+
+process_stream <- read_folder %>%
+  mutate(x = as.double(x)) %>%
+  ft_binarizer(
+    input_col = "x",
+    output_col = "over",
+    threshold = 400
+  )
+
+write_output <- stream_write_csv(process_stream, "source-out")
+invisible(future(stream_generate_test(interval = 0.2, iterations = 100)))
+```
+
+
+```{r}
+library(sparklyr)
+library(ggplot2)
+library(dplyr)
+
+iris_tbl <- copy_to(sc, iris, "iris", overwrite = TRUE)
+
+iris_tbl
+
+kmeans_model <- iris_tbl %>%
+  ml_kmeans(k = 3, features = c("Petal_Length", "Petal_Width"))
+
+predicted <- ml_predict(kmeans_model, iris_tbl) %>%
+  collect()
+
+table(predicted$Species, predicted$prediction)
+```
+
+```{r}
+predicted %>%
+  ggplot(aes(Petal_Length, Petal_Width)) +
+  geom_point(aes(Petal_Width, Petal_Length, col = factor(prediction + 1)),
+    size = 2, alpha = 0.5
+  ) +
+  geom_point(
+    data = kmeans_model$centers, aes(Petal_Width, Petal_Length),
+    col = scales::muted(c("red", "green", "blue")),
+    pch = "x", size = 12
+  ) +
+  scale_color_discrete(
+    name = "Predicted Cluster",
+    labels = paste("Cluster", 1:3)
+  ) +
+  labs(
+    x = "Petal Length",
+    y = "Petal Width",
+    title = "K-Means Clustering",
+    subtitle = "Use Spark.ML to predict cluster membership with the iris dataset."
+  )
+```
+
+
+
+```{r}
+lm_model <- iris_tbl %>%
+  ml_linear_regression(Petal_Length ~ Petal_Width)
+
+spark_slope <- coef(lm_model)[["Petal_Width"]]
+spark_intercept <- coef(lm_model)[["(Intercept)"]]
+
+iris_tbl %>%
+  select(Petal_Width, Petal_Length) %>%
+  collect() %>%
+  ggplot(aes(Petal_Length, Petal_Width)) +
+  geom_point(aes(Petal_Width, Petal_Length), size = 2, alpha = 0.5) +
+  geom_abline(aes(
+    slope = spark_slope,
+    intercept = spark_intercept
+  ),
+  color = "red"
+  ) +
+  labs(
+    x = "Petal Width",
+    y = "Petal Length",
+    title = "Linear Regression: Petal Length ~ Petal Width",
+    subtitle = "Use Spark.ML linear regression to predict petal length as a function of petal width."
+  )
+```
+
+```{r}
+library(nycflights13)
+library(sparklyr)
+library(dplyr)
+
+spark_flights <- copy_to(sc, flights, overwrite = TRUE)
+
+df <- spark_flights %>%
+  filter(!is.na(dep_delay)) %>%
+  mutate(
+    month = paste0("m", month),
+    day = paste0("d", day)
+  ) %>%
+  select(dep_delay, sched_dep_time, month, day, distance) 
+
+flights_pipeline <- ml_pipeline(sc) %>%
+  ft_dplyr_transformer(
+    tbl = df
+    ) %>%
+  ft_binarizer(
+    input_col = "dep_delay",
+    output_col = "delayed",
+    threshold = 15
+  ) %>%
+  ft_bucketizer(
+    input_col = "sched_dep_time",
+    output_col = "hours",
+    splits = c(400, 800, 1200, 1600, 2000, 2400)
+  )  %>%
+  ft_r_formula(delayed ~ month + day + hours + distance) %>% 
+  ml_logistic_regression()
+
+partitioned_flights <- sdf_random_split(
+  spark_flights,
+  training = 0.01,
+  testing = 0.01,
+  rest = 0.98
+)
+
+fitted_pipeline <- ml_fit(
+  flights_pipeline,
+  partitioned_flights$training
+)
+
+predictions <- ml_transform(
+  fitted_pipeline,
+  partitioned_flights$testing
+)
+
+predictions %>%
+  count(delayed, prediction) 
+ 
+```
+
+
+```{r}
+library(modeldata)
+
+data("small_fine_foods")
+
+sff_training_data <- copy_to(sc, training_data, overwrite = TRUE)
+
+sff_testing_data <- copy_to(sc, testing_data, overwrite = TRUE)
+
+sff_pipeline <- ml_pipeline(sc) %>% 
+  ft_tokenizer(
+    input_col = "review",
+    output_col = "word_list"
+  ) %>% 
+  ft_stop_words_remover(
+    input_col = "word_list", 
+    output_col = "wo_stop_words"
+    ) %>% 
+  ft_hashing_tf(
+    input_col = "wo_stop_words", 
+    output_col = "hashed_features", 
+    binary = TRUE, 
+    num_features = 1024
+    ) %>%
+  ft_normalizer(
+    input_col = "hashed_features", 
+    output_col = "normal_features"
+    ) %>% 
+  ft_r_formula(score ~ normal_features) %>% 
+  ml_logistic_regression()  
+
+sff_pipeline_model <- ml_fit(sff_pipeline, sff_training_data)
+
+sff_test_predictions <- sff_pipeline_model %>% 
+  ml_transform(sff_testing_data) 
+
+sff_test_predictions
+```
+
+
+```{r}
+data(cells, package = "modeldata")
+tbl_cells <- copy_to(sc, cells, name = "cells_tbl")
+
+tbl_cells_split <- tbl_cells %>% 
+  select(-case) %>% 
+  sdf_random_split(
+    training = 0.8, 
+    test = 0.2, 
+    seed = 100
+    )
+
+cells_pipeline <- sc %>% 
+  ml_pipeline() %>%
+  ft_r_formula(class ~ .) %>%
+  ml_random_forest_classifier(seed = 207336481)
+
+cells_grid <- list(
+  random_forest_classifier = list(  
+    num_trees = 1:20 * 5
+  )
+)
+
+cells_evaluator <- ml_multiclass_classification_evaluator(
+  x = sc,
+  metric_name = "accuracy"
+  )
+
+cells_cv <- ml_cross_validator(
+  x = sc,
+  estimator = cells_pipeline, 
+  estimator_param_maps = cells_grid,
+  evaluator = cells_evaluator,
+  num_folds = 5,
+  parallelism = 4
+)
+
+model_cv <- ml_fit(
+  x = cells_cv, 
+  dataset = tbl_cells_split$training
+  )
+
+cv_metrics <- ml_validation_metrics(model_cv)
+
+library(ggplot2)
+
+cv_metrics %>% 
+  ggplot(aes(num_trees_1, accuracy)) +
+  geom_line() +
+  geom_smooth()
+
+cell_model <- ml_random_forest_classifier(
+  tbl_cells_split$training, 
+  class ~ ., 
+  num_trees = 50
+  )
+
+cell_model %>% 
+  ml_predict(tbl_cells_split$test) %>% 
+  ml_metrics_multiclass()
+```
+
+
+```{r}
+library(sparklyr)
+library(modeldata)
+
+data("small_fine_foods")
+
+sff_training_data <- copy_to(sc, training_data, overwrite = T)
+sff_testing_data <- copy_to(sc, testing_data, overwrite = T)
+
+sff_pipeline <- ml_pipeline(sc) %>% 
+  ft_tokenizer(
+    input_col = "review",
+    output_col = "word_list"
+  ) %>% 
+  ft_stop_words_remover(
+    input_col = "word_list", 
+    output_col = "wo_stop_words"
+    ) %>% 
+  ft_hashing_tf(
+    input_col = "wo_stop_words", 
+    output_col = "hashed_features", 
+    binary = TRUE, 
+    num_features = 1024
+    ) %>%
+  ft_normalizer(
+    input_col = "hashed_features", 
+    output_col = "normal_features"
+    ) %>% 
+  ft_r_formula(score ~ normal_features) %>% 
+  ml_logistic_regression()
+
+sff_grid <-  list(
+    hashing_tf = list(
+      num_features = 2^c(8, 10, 12)  
+    ),
+    logistic_regression = list(
+      elastic_net_param = 10^seq(-3, 0, length = 20), 
+      reg_param = seq(0, 1, length = 5)    
+    )
+  )
+
+sff_evaluator <- ml_binary_classification_evaluator(sc)
+
+sff_cv <- ml_cross_validator(
+  x = sc,
+  estimator = sff_pipeline, 
+  estimator_param_maps = sff_grid,
+  evaluator = sff_evaluator,
+  num_folds = 3,
+  parallelism = 4,
+  seed = 100
+)
+
+sff_model <- ml_fit(
+  x = sff_cv, 
+  dataset = sff_training_data
+  )
+
+sff_metrics <- ml_validation_metrics(sff_model)
+
+library(dplyr)
+
+sff_metrics %>% 
+  arrange(desc(areaUnderROC)) %>% 
+  head()
+
+library(ggplot2)
+
+sff_metrics %>% 
+  mutate(reg_param_1 = as.factor(reg_param_1)) %>% 
+  ggplot(aes(
+    x = elastic_net_param_1, 
+    y = areaUnderROC, 
+    color = reg_param_1
+    )) +
+  geom_line() +
+  geom_point(size = 0.5) +
+  scale_x_continuous(trans = "log10") +
+  facet_wrap(~ num_features_2) +
+  theme_light(base_size = 9)
+
+new_sff_pipeline <- ml_pipeline(sc) %>% 
+  ft_tokenizer(
+    input_col = "review",
+    output_col = "word_list"
+  ) %>% 
+  ft_stop_words_remover(
+    input_col = "word_list", 
+    output_col = "wo_stop_words"
+    ) %>% 
+  ft_hashing_tf(
+    input_col = "wo_stop_words", 
+    output_col = "hashed_features", 
+    binary = TRUE, 
+    num_features = 4096      
+    ) %>%
+  ft_normalizer(
+    input_col = "hashed_features", 
+    output_col = "normal_features"
+    ) %>% 
+  ft_r_formula(score ~ normal_features) %>% 
+  ml_logistic_regression(
+    elastic_net_param = 0.05,
+    reg_param = 0.25  
+    )
+
+new_sff_fitted <- new_sff_pipeline %>% 
+  ml_fit(sff_training_data)
+
+new_sff_fitted %>% 
+  ml_transform(sff_testing_data) %>% 
+  ml_metrics_binary()
+```
+
+```{r}
+spark_disconnect(sc)
+```
+
+ 

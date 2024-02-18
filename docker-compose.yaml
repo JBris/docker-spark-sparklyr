@@ -1,0 +1,98 @@
+version: "3.9"
+
+services:
+
+  spark:
+    image: docker.io/bitnami/spark:${SPARK_TAG}
+    container_name: ${PROJECT_NAME}-spark
+    hostname: spark
+    restart: unless-stopped
+    stop_grace_period: 10s
+    env_file: .env
+    environment:
+      SPARK_MODE: master
+      SPARK_RPC_AUTHENTICATION_ENABLED: no
+      SPARK_RPC_ENCRYPTION_ENABLED: no
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: no
+      SPARK_SSL_ENABLED: no
+      SPARK_USER: spark
+    ports:
+      - ${SPARK_UI_PORT}:8080
+      - ${SPARK_SUBMIT_PORT}:7077
+
+  spark-worker:
+    image: docker.io/bitnami/spark:${SPARK_TAG}
+    container_name: ${PROJECT_NAME}-spark-worker
+    hostname: spark_worker
+    restart: unless-stopped
+    stop_grace_period: 10s
+    env_file: .env
+    environment:
+      SPARK_MODE: worker
+      SPARK_MASTER_URL: spark://spark:7077
+      SPARK_WORKER_MEMORY: 1G
+      SPARK_WORKER_CORES: 1
+      SPARK_RPC_AUTHENTICATION_ENABLED: no
+      SPARK_RPC_ENCRYPTION_ENABLED: no
+      SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED: no
+      SPARK_SSL_ENABLED: no
+      SPARK_USER: spark
+
+  rstudio:
+    image: rocker/tidyverse:${TIDYVERSE_TAG}
+    container_name: ${PROJECT_NAME}-rstudio
+    hostname: rstudio
+    restart: unless-stopped
+    stop_grace_period: 10s
+    env_file: .env
+    environment:
+      SPARK_MASTER_URL: spark://spark:7077
+      SPARK_USER: spark
+      USER: $R_STUDIO_USER
+      PASSWORD: $R_STUDIO_PASSWORD
+      ROOT: "TRUE"
+      DISABLE_AUTH: "TRUE"
+      R_SEED: $R_SEED
+    build:
+      context: .
+      args:
+        TIDYVERSE_TAG: $TIDYVERSE_TAG
+    ports:
+      - ${R_STUDIO_PORT}:8787
+    volumes:
+      - ./r_home:/home
+
+  postgres:
+    image: postgres:${POSTGRES_TAG}
+    container_name: ${PROJECT_NAME}-postgres
+    hostname: postgres
+    restart: unless-stopped
+    stop_grace_period: 10s
+    env_file: .env
+    environment:
+      POSTGRES_PASSWORD: $DB_PASSWORD
+      POSTGRES_DB: $DB_NAME
+      POSTGRES_USER: $DB_USER
+    ports:
+      - ${DB_PORT}:5432
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./sql/init.sql:/docker-entrypoint-initdb.d/init.sql
+
+  adminer:
+    image: adminer:${ADMINER_TAG}
+    container_name: ${PROJECT_NAME}-adminer
+    hostname: adminer
+    restart: unless-stopped
+    stop_grace_period: 10s
+    env_file: .env
+    ports:
+      - ${ADMINER_PORT}:8080
+
+networks:
+  default:
+    name: $PROJECT_NAME
+    driver: bridge
+
+volumes:
+  postgres-data: {}
